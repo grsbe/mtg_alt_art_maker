@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Print sheet</title>
+  <style id="page-size">@page { size: A4; margin: 0; }</style>
+  <style>
+    :root { --bg: #16171b; --panel: #1f2026; --line: #34363f; --text: #e6e6ea; --muted: #9a9ca6; --accent: #d9a441; color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, "Segoe UI", sans-serif; display: flex; min-height: 100vh; }
+    .controls { width: 300px; flex: none; padding: 18px; background: var(--panel); border-right: 1px solid var(--line);
+                position: sticky; top: 0; height: 100vh; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+    .controls h1 { font-size: 18px; margin: 0; color: var(--accent); }
+    .controls label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+    .controls label.check { flex-direction: row; align-items: center; gap: 8px; font-size: 14px; color: var(--text); cursor: pointer; }
+    select, input[type=number] { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; }
+    button { background: var(--accent); color: #1a1408; border: 0; border-radius: 6px; padding: 9px 14px; font: inherit; font-weight: 600; cursor: pointer; }
+    .summary { color: var(--muted); font-size: 13px; }
+    .summary strong { color: var(--text); }
+    .missing { font-size: 12px; color: var(--muted); max-height: 200px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+    .missing:empty { display: none; }
+    .hint { color: var(--muted); font-size: 12px; }
+
+    .pages { flex: 1; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 24px; overflow-x: auto; }
+    .page { background: #fff; position: relative; flex: none; box-shadow: 0 6px 24px rgba(0,0,0,.5); overflow: hidden; }
+    .sheet { position: absolute; display: grid; }
+    .card { width: 63mm; height: 88mm; position: relative; }
+    .card img { width: 100%; height: 100%; display: block; }
+    .black-corners .card { background: #000; }
+    .placeholder-card img { opacity: .9; }
+    .placeholder-card::after { content: "no proxy yet"; position: absolute; left: 0; right: 0; bottom: 6mm; text-align: center;
+                               font: bold 3.2mm sans-serif; color: #c00; background: rgba(255,255,255,.85); padding: 1mm; }
+    .mark { position: absolute; background: #000; }
+
+    @media print {
+      body { background: #fff; display: block; }
+      .controls { display: none; }
+      .pages { padding: 0; gap: 0; display: block; }
+      .page { box-shadow: none; break-after: page; }
+      .page:last-child { break-after: auto; }
+      .placeholder-card::after { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <aside class="controls">
+    <h1>Print sheet</h1>
+    <div class="summary" id="summary">Loading…</div>
+    <label>Paper
+      <select id="paper">
+        <option value="A4">A4 (210 × 297 mm)</option>
+        <option value="Letter">US Letter (8.5 × 11 in)</option>
+      </select>
+    </label>
+    <label>Gap between cards
+      <select id="gap">
+        <option value="0">None (cut along shared lines)</option>
+        <option value="1">1 mm</option>
+        <option value="2">2 mm</option>
+        <option value="3">3 mm</option>
+      </select>
+    </label>
+    <label>Cards without an exported proxy
+      <select id="missing-mode">
+        <option value="skip">Leave them out</option>
+        <option value="original">Use the original card image (marked on screen)</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="marks" checked> Cut marks</label>
+    <label class="check"><input type="checkbox" id="corners" checked> Black corners (easier cutting)</label>
+    <label class="check"><input type="checkbox" id="basics"> Include basic lands</label>
+    <label class="check"><input type="checkbox" id="done-only"> Only cards marked done</label>
+    <button id="print">Print / save as PDF</button>
+    <p class="hint">In the print dialog choose <strong>100% / actual size</strong> (no "fit to page") and no margins,
+      so the cards come out at exactly 63 × 88 mm.</p>
+    <div class="missing" id="missing"></div>
+  </aside>
+  <main class="pages" id="pages"></main>
+
+  <script src="print.js"></script>
+</body>
+</html>

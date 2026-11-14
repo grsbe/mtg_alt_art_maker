@@ -1,0 +1,16 @@
+# Rebuildable from Scryfall — every collaborator downloads their own copy.
+cache/
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Card frames are Wizards of the Coast artwork: everyone downloads them with `uv run fetch_frames.py`.
+frames/*
+!frames/README.md
+public/fonts/card/
