@@ -4,4 +4,7 @@ version = "0.1.0"
 description = "Local web tool for designing alternative-art / alternative-name proxies for a Commander deck."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "fastapi>=0.162.5",
+    "uvicorn>=0.54.0",
+]

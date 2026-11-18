@@ -1,20 +1,32 @@
 # MTG Alt Art Maker
 
-A small local web app for designing alternative-art / alternative-name proxies for a Commander deck.
+A small web app for designing alternative-art / alternative-name proxies for a Commander deck.
 Paste a decklist, browse the cards sorted by type, rename them (the original name becomes the subtitle),
-drop in your own art, and export print-ready PNGs. Everything is stored in plain files so a group can
-collaborate through git.
+drop in your own art, and export print-ready PNGs. Everything is stored in plain files; a group can
+work on the same deck together on one shared server.
 
 ## Running it
 
-You need [uv](https://docs.astral.sh/uv/). No other dependencies — the server uses only the Python standard library.
+You need [uv](https://docs.astral.sh/uv/). It installs the server's dependencies (FastAPI and uvicorn) on the first run.
 
 ```sh
 uv run fetch_frames.py   # once: downloads the card frames and fonts (~170 MB, see "Frames")
 uv run server.py
 ```
 
-This opens <http://127.0.0.1:8765> in your browser (or the next free port). Options: `--port 9000`, `--no-browser`.
+This opens <http://127.0.0.1:8765> in your browser (or the next free port). Options: `--port 9000`, `--no-browser`,
+`--host 0.0.0.0` (listen on all network interfaces), `--access-log` (log every request).
+
+### On a server
+
+Several people can work on the same deck at once; every browser picks up the others' changes within a few
+seconds. The app has no login, so put it behind a reverse proxy that handles the password and HTTPS, and run:
+
+```sh
+uv run uvicorn server:app --host 127.0.0.1 --port 8765
+```
+
+Use a single worker process (uvicorn's default): deck writes are coordinated by locks inside the process.
 
 ## Using it
 
@@ -49,14 +61,14 @@ Changes save automatically to the deck's `deck.json`.
 
 | Path                     | In git | What                                                                    |
 |--------------------------|--------|-------------------------------------------------------------------------|
-| `decks/<deck>/deck.json` | yes    | The deck: card list, custom names, subtitles, frame, art crop, done     |
-| `decks/<deck>/art/`      | yes    | Your source art, named after the card (`sol_ring.png`)                  |
-| `decks/<deck>/proxies/`  | yes    | Exported proxy PNGs                                                     |
+| `decks/<deck>/deck.json` | no     | The deck: card list, custom names, subtitles, frame, art crop, done     |
+| `decks/<deck>/art/`      | no     | Your source art, named after the card (`sol_ring.png`)                  |
+| `decks/<deck>/proxies/`  | no     | Exported proxy PNGs                                                     |
 | `cache/`                 | no     | Scryfall card data, images and mana symbols, shared by all decks; re-downloaded automatically after a fresh clone |
 | `frames/<pack>/`         | no     | Blank card frames, downloaded by `fetch_frames.py` (see `frames/README.md`) |
 | `public/fonts/card/`     | no     | Beleren + MPlantin, downloaded by `fetch_frames.py`                     |
 | `fetch_frames.py`        | yes    | Downloads frames and fonts from Card Conjurer and converts them         |
-| `server.py`              | yes    | Local server (Scryfall import, caching, file storage)                   |
+| `server.py`              | yes    | Server, FastAPI (Scryfall import, caching, file storage)                |
 | `public/`                | yes    | The web UI (`render.js` draws the card)                                 |
 
 ## Frames
