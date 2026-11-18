@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.DS_Store
+Thumbs.db
+cache/
+decks/
+frames/*
+!frames/README.md
+public/fonts/card/

@@ -2,7 +2,7 @@
 
 A small local web app for designing alternative-art / alternative-name proxies for a Commander deck.
 Paste a decklist, browse the cards sorted by type, rename them (the original name becomes the subtitle),
-drop in your own art, and export print-ready PNGs. Everything is stored in plain files so a group can
+drop in your own art, and export print-ready WebPs. Everything is stored in plain files so a group can
 collaborate through git.
 
 ## Running it
@@ -29,13 +29,13 @@ This opens <http://127.0.0.1:8765> in your browser (or the next free port). Opti
    `\_/` by default or rounded), frame, frame color
    (including two-color split frames), and optional text overrides.
    Cards with two parts get a switch at the top of the editor: double-faced cards (transform and modal;
-   front/back, each with its own name, art and PNG), split and aftermath cards (two halves with their own
-   art, one PNG), flip cards and adventures (one picture, both names/texts editable).
+   front/back, each with its own name, art and WebP), split and aftermath cards (two halves with their own
+   art, one WebP), flip cards and adventures (one picture, both names/texts editable).
    Sagas, planeswalkers, classes, levelers and battles use their own frame layouts automatically.
 4. **Art**: drop an image onto the editor or straight onto a gallery card, paste with Ctrl+V,
    or use *Choose art…*. Drag to move, scroll to zoom, rotate with the slider.
    The original file is kept untouched; only the position/zoom/rotation is saved.
-5. **Export proxy PNG** writes a 1490×2080 image to the deck's `proxies/` and marks the card **done**
+5. **Export proxy WebP** writes a 1490×2080 image to the deck's `proxies/` and marks the card **done**
    (green check in the gallery, counter in the top bar). You can also tick *Done* by hand in the editor.
 
 6. **Print sheet** (top bar) opens a printable page: the exported proxies at real size (63 × 88 mm),
@@ -51,7 +51,7 @@ Changes save automatically to the deck's `deck.json`.
 |--------------------------|--------|-------------------------------------------------------------------------|
 | `decks/<deck>/deck.json` | yes    | The deck: card list, custom names, subtitles, frame, art crop, done     |
 | `decks/<deck>/art/`      | yes    | Your source art, named after the card (`sol_ring.png`)                  |
-| `decks/<deck>/proxies/`  | yes    | Exported proxy PNGs                                                     |
+| `decks/<deck>/proxies/`  | yes    | Exported proxy WebPs                                                    |
 | `cache/`                 | no     | Scryfall card data, images and mana symbols, shared by all decks; re-downloaded automatically after a fresh clone |
 | `frames/<pack>/`         | no     | Blank card frames, downloaded by `fetch_frames.py` (see `frames/README.md`) |
 | `public/fonts/card/`     | no     | Beleren + MPlantin, downloaded by `fetch_frames.py`                     |
@@ -88,7 +88,7 @@ commit often, and pull before starting.
 
 - [x] Decklist import, Scryfall lookup, local cache
 - [x] Type-sorted gallery, editor, `deck.json` saving
-- [x] Art drop/paste, move/zoom/rotate, basic canvas rendering, PNG export
+- [x] Art drop/paste, move/zoom/rotate, basic canvas rendering, WebP export
 - [x] Multiple decks (one folder each), done checkmarks, official Scryfall mana symbols
 - [x] Card-style fonts (real ones if installed, free lookalikes otherwise)
 - [x] Image frame packs (M15 + 8 showcase/borderless packs), legendary crowns, P/T boxes

@@ -421,7 +421,7 @@ def new_entry(card_id: str, name: str) -> dict:
         "art": None,  # relative to the deck folder, e.g. "art/sol_ring.png"
         "crop": {"x": 0, "y": 0, "scale": 1, "rot": 0},
         "overrides": {},
-        "proxy": None,  # relative to the deck folder, e.g. "proxies/sol_ring.png"
+        "proxy": None,  # relative to the deck folder, e.g. "proxies/sol_ring.webp"
         "notes": "",
     }
 
@@ -869,7 +869,7 @@ class Handler(BaseHTTPRequestHandler):
         self.fail(HTTPStatus.NOT_FOUND, "Not found")
 
     def upload(self, d: Path, kind: str, card_id: str, query: dict) -> None:
-        ext = "png" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
+        ext = "webp" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
         if ext not in ART_EXTS:
             return self.fail(HTTPStatus.BAD_REQUEST, f"Unsupported image type: {ext}")
         body = self.read_body()

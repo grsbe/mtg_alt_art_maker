@@ -480,7 +480,7 @@ function fillTile(tile, entry) {
   const badges = el("div", "badges");
   if (faceCount(card) > 1) badges.append(el("span", "badge", { dfc: "2 FACES", split: "SPLIT", adventure: "ADV" }[cardKind(card)]));
   if (entry.art || entry.back?.art) badges.append(el("span", "badge", "ART"));
-  if (entry.proxy || entry.back?.proxy) badges.append(el("span", "badge", "PNG"));
+  if (entry.proxy || entry.back?.proxy) badges.append(el("span", "badge", "WEBP"));
   tile.append(badges);
   const name = [entry.customName, entry.back?.customName].filter(Boolean).join(" // ");
   if (name || state.mode !== "large") {
@@ -968,9 +968,9 @@ async function exportProxy() {
   const otherDone = kind !== "dfc" || !!(face === 0 ? entry.back?.proxy : entry.proxy);
   await flushSave();
   await fontsReady;
-  await ensureImages(renderNow() || []); // make sure symbols and frame images are in the PNG
+  await ensureImages(renderNow() || []); // make sure symbols and frame images are loaded before exporting
   renderNow();
-  const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+  const blob = await new Promise((r) => canvas.toBlob(r, "image/webp", 0.92));
   try {
     const res = await tracked(api(deckApi(`/proxy/${entry.id}?face=${face}&done=${otherDone ? 1 : 0}`), { method: "POST", body: blob }));
     entry.done = state.base[entry.id]?.done; // the server decides "done" on export
