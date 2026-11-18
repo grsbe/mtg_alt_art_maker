@@ -908,7 +908,7 @@ def get_job():
 # ---- uploads: raw image bytes in the body ----
 
 def save_upload(d: Path, kind: str, card_id: str, query: dict, body: bytes) -> dict:
-    ext = "png" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
+    ext = "webp" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
     if ext not in ART_EXTS:
         raise fail(HTTPStatus.BAD_REQUEST, f"Unsupported image type: {ext}")
     if not body:

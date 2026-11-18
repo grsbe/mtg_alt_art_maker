@@ -1,7 +1,12 @@
 FROM python:3.12-slim
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -10,18 +15,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Fetch frames and fonts first so this ~170 MB layer stays cached across code changes
+# Install Python dependencies (FastAPI, uvicorn) from lockfile in a cached layer
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Fetch frames and fonts so this ~170 MB layer stays cached across code changes
 COPY fetch_frames.py ./
 COPY frames/README.md ./frames/README.md
 RUN python fetch_frames.py
 
 # Copy application code and static assets
 COPY public/ ./public/
-COPY server.py pyproject.toml README.md ./
+COPY server.py README.md ./
 
 # Create persistent data directories
 RUN mkdir -p /app/decks /app/cache
 
 EXPOSE 8765
 
-CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
+# Run a single uvicorn worker (deck writes are coordinated by in-process locks)
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8765", "--proxy-headers"]
