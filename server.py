@@ -169,7 +169,11 @@ def symbol_file(basename: str) -> Path | None:
     uri = next((u for u in symbol_index().values() if u.rsplit("/", 1)[-1] == basename), None)
     if not uri:
         return None
-    _write_atomic(dest, _sized_svg(_http(uri, throttle=False)))
+    try:
+        _write_atomic(dest, _sized_svg(_http(uri, throttle=False)))
+    except PermissionError:  # Windows: another request is swapping in the same file right now
+        if not dest.exists():
+            raise
     return dest
 
 
@@ -719,9 +723,14 @@ STATIC_MOUNTS = [("/cache/", CACHE), ("/decks/", DECKS), ("/frames/", FRAMES), (
 
 def _write_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    # A unique temp name per write: two threads writing the same file must not share one temp file.
+    tmp = path.with_name(f"{path.name}.{threading.get_ident()}.{time.monotonic_ns()}.tmp")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 class Handler(BaseHTTPRequestHandler):
