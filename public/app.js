@@ -36,6 +36,10 @@ const state = {
   refreshed: new Set(), // decks whose missing cache we already asked the server to fetch
   symbolMap: {}, // "{W}" -> "/symbols/W.svg"
   frames: [], // frame packs from frames/ (see /api/frames)
+  // Live sync with other people editing the same deck (see "live sync" below).
+  rev: null, // version of deck.json we last loaded
+  base: {}, // card id -> the entry as the server last sent it; local fields that differ are unsaved edits
+  fileVer: {}, // "art/sol_ring.png" -> version for cache busting (server mtime, or "local…" after our own upload)
 };
 
 // ---------------------------------------------------------------- image cache
@@ -76,7 +80,17 @@ const store = {
   get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode etc. */ } },
 };
-const deckFileUrl = (rel) => (rel ? `/decks/${encodeURIComponent(state.slug)}/${rel}?v=${state.bust}` : null);
+const deckFileUrl = (rel) => (rel ? `/decks/${encodeURIComponent(state.slug)}/${rel}?v=${state.fileVer[rel] ?? state.bust}` : null);
+const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
+/** Deep equality for JSON data; null and missing count as the same, key order doesn't matter. */
+function eq(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null) return a == null && b == null;
+  if (typeof a !== "object" || typeof b !== "object" || Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) if (!eq(a[k], b[k])) return false;
+  return true;
+}
 
 // ---------------------------------------------------------------- cards and faces
 const entryById = (id) => state.deck?.cards.find((c) => c.id === id);
@@ -195,7 +209,7 @@ async function renameDeck() {
   const name = prompt("Rename deck:", state.deck.name);
   if (!name || !name.trim() || name.trim() === state.deck.name) return;
   try {
-    await api(deckApi(), jsonOpts("PATCH", { name: name.trim() }));
+    await tracked(api(deckApi(), jsonOpts("PATCH", { name: name.trim() })));
     state.deck.name = name.trim();
     await loadDecks();
   } catch (e) { alert(e.message); }
@@ -208,6 +222,9 @@ async function loadDeck() {
   if (slug !== state.slug) return; // user switched decks while loading
   state.deck = data.deck;
   state.cards = data.cards;
+  state.rev = data.rev;
+  state.fileVer = { ...data.files };
+  state.base = Object.fromEntries(data.deck.cards.map((c) => [c.id, clone(c)]));
   renderGallery();
   updateProgress();
   if (state.selectedId && entryById(state.selectedId)) select(state.selectedId, state.face);
@@ -493,12 +510,18 @@ function select(id, face = 0) {
   state.selectedId = id;
   document.querySelectorAll(".tile.selected").forEach((t) => t.classList.remove("selected"));
   document.querySelector(`.tile[data-id="${id}"]`)?.classList.add("selected");
-  const entry = selected();
-  const card = cardOf(entry);
-  state.face = Math.min(face, faceCount(card) - 1);
+  state.face = Math.min(face, faceCount(cardOf(selected())) - 1);
   writeHash();
   showEditor(true);
+  fillEditor();
+  setSaveStatus("");
+  loadArt();
+}
 
+/** Fill every editor field from the selected card (also used when someone else changed it). */
+function fillEditor() {
+  const entry = selected();
+  const card = cardOf(entry);
   $("#orig-img").src = faceImages(card, 0)?.large || "";
   $("#orig-name").textContent = entry.name;
   const qty = entry.qty || 1;
@@ -510,8 +533,6 @@ function select(id, face = 0) {
   $("#f-notes").value = entry.notes || "";
   fillFrameSelects();
   fillFaceForm();
-  setSaveStatus("");
-  loadArt();
 }
 
 /** Face switcher + every field that belongs to the current face. */
@@ -751,14 +772,169 @@ async function flushSave() {
   saveId = null;
   const entry = id && slug === state.slug && entryById(id);
   if (!entry) return;
-  const body = Object.fromEntries(SAVE_KEYS.filter((k) => k in entry).map((k) => [k, entry[k]]));
+  // Send only what was edited here, so we don't overwrite fields someone else changed meanwhile.
+  const body = unsavedChanges(entry);
+  if (!Object.keys(body).length) { if (id === state.selectedId) setSaveStatus("Saved to deck.json"); return; }
   try {
-    await api(`/api/decks/${encodeURIComponent(slug)}/cards/${id}`, jsonOpts("PATCH", body));
+    const res = await tracked(api(`/api/decks/${encodeURIComponent(slug)}/cards/${id}`, jsonOpts("PATCH", body)));
+    const now = slug === state.slug && entryById(id);
+    if (now && mergeEntry(now, res.entry)) remoteTouched(new Set([id]));
     if (id === state.selectedId) setSaveStatus("Saved to deck.json");
   } catch (e) {
     setSaveStatus(`Save failed: ${e.message}`);
   }
 }
+
+// ---------------------------------------------------------------- live sync
+// Several people can have the app open at once (e.g. through a Cloudflare tunnel). Every few seconds we
+// ask the server for the deck's version; when it changed, we fetch the deck and merge it card by card.
+// A field counts as edited here while it differs from what the server last sent (state.base): those keep
+// the local value, everything else takes the server's.
+const SYNC_MS = 3000;
+const BACK_SAVE_KEYS = ["customName", "subtitle", "hideSubtitle", "subtitleStyle", "frameColor", "crop", "overrides"];
+let inflight = 0; // writes on their way to the server
+let writeSeq = 0; // bumped when a write finishes; a deck fetched across a write may be stale
+
+async function tracked(promise) {
+  inflight++;
+  try { return await promise; } finally { inflight--; writeSeq++; }
+}
+
+/** The editable fields of entry that differ from the server's copy, shaped as a PATCH body. */
+function unsavedChanges(entry) {
+  const base = state.base[entry.id] || {};
+  const body = {};
+  for (const k of SAVE_KEYS) {
+    if (k !== "back" && k in entry && !eq(entry[k], base[k])) body[k] = entry[k];
+  }
+  if (entry.back) {
+    const bb = base.back || {};
+    const back = Object.fromEntries(BACK_SAVE_KEYS.filter((k) => k in entry.back && !eq(entry.back[k], bb[k])).map((k) => [k, entry.back[k]]));
+    if (Object.keys(back).length) body.back = back;
+  }
+  return body;
+}
+
+/** Copy keys from remote into target, except those edited locally. Returns true if anything changed. */
+function adoptKeys(target, remote, base, editable) {
+  let changed = false;
+  for (const k of new Set([...Object.keys(target), ...Object.keys(remote)])) {
+    if (k === "back" && editable === SAVE_KEYS) continue; // merged key by key below
+    if (editable.includes(k) && !eq(target[k], base[k])) continue;
+    if (eq(target[k], remote[k])) continue;
+    if (remote[k] === undefined) delete target[k];
+    else target[k] = clone(remote[k]);
+    changed = true;
+  }
+  return changed;
+}
+
+/** Merge the server's version of a card into the local one. Returns true if anything visible changed. */
+function mergeEntry(entry, remote) {
+  const base = state.base[entry.id] || {};
+  let changed = adoptKeys(entry, remote, base, SAVE_KEYS);
+  if (remote.back) {
+    if (!entry.back) { entry.back = {}; changed = true; }
+    changed = adoptKeys(entry.back, remote.back, base.back || {}, BACK_SAVE_KEYS) || changed;
+  } else if (entry.back && !unsavedChanges(entry).back) {
+    delete entry.back;
+    changed = true;
+  }
+  state.base[entry.id] = clone(remote);
+  return changed;
+}
+
+const artKey = (e) => (e ? [e.art, state.fileVer[e.art], e.back?.art, state.fileVer[e.back?.art]].join("|") : "");
+const fileVersions = (e) => [e, e.back || {}].flatMap((s) => [s.art, s.proxy]).filter(Boolean).map((rel) => `${rel}@${state.fileVer[rel]}`).join("|");
+/** Cards whose grouping or the group headers' counts would change need a full gallery redraw. */
+const gallerySignature = () => (state.deck?.cards || []).map((e) => `${e.id}:${groupOf(e, cardOf(e))}:${e.qty}:${e.done ? 1 : 0}`).join(",");
+
+let syncBusy = false;
+async function syncTick() {
+  if (syncBusy || !state.slug || !state.deck || document.hidden || inflight) return;
+  syncBusy = true;
+  const slug = state.slug;
+  try {
+    const { rev } = await api(deckApi("/rev"));
+    if (slug !== state.slug || rev === state.rev || inflight) return;
+    const seq = writeSeq;
+    const data = await api(deckApi());
+    if (slug !== state.slug || !state.deck || seq !== writeSeq || inflight) return; // retry next tick
+    applyRemoteDeck(data);
+  } catch { /* server briefly unreachable: try again next tick */ }
+  finally { syncBusy = false; }
+}
+
+function applyRemoteDeck(data) {
+  // Our own uploads carry a temporary "local…" version; swap in the server's without counting it as a change.
+  for (const [rel, v] of Object.entries(state.fileVer)) {
+    if (String(v).startsWith("local") && rel in data.files) state.fileVer[rel] = data.files[rel];
+  }
+  const before = gallerySignature();
+  const oldName = state.deck.name;
+  const oldFrame = state.deck.defaultFrame;
+  const oldArt = artKey(selected());
+  const local = new Map(state.deck.cards.map((c) => [c.id, c]));
+  const oldFiles = new Map(state.deck.cards.map((c) => [c.id, fileVersions(c)]));
+  state.fileVer = { ...data.files };
+
+  const touched = new Set();
+  const cards = data.deck.cards.map((remote) => {
+    const entry = local.get(remote.id);
+    if (!entry) { state.base[remote.id] = clone(remote); touched.add(remote.id); return remote; }
+    if (mergeEntry(entry, remote) || oldFiles.get(entry.id) !== fileVersions(entry)) touched.add(entry.id);
+    return entry;
+  });
+  const remoteIds = new Set(cards.map((c) => c.id));
+  const removed = state.deck.cards.some((c) => !remoteIds.has(c.id));
+  state.deck = { ...data.deck, cards };
+  state.cards = data.cards;
+  state.rev = data.rev;
+
+  if (state.deck.defaultFrame !== oldFrame) {
+    fillFrameSelects();
+    state.deck.cards.forEach((c) => touched.add(c.id));
+  }
+  if (state.deck.name !== oldName) refreshDeckList();
+  if (!touched.size && !removed) return;
+
+  if (removed || gallerySignature() !== before) {
+    const g = $("#gallery"), top = g.scrollTop;
+    renderGallery();
+    g.scrollTop = top;
+  } else touched.forEach(updateTile);
+  updateProgress();
+
+  if (state.selectedId && !entryById(state.selectedId)) {
+    state.selectedId = null;
+    showEditor(false);
+    writeHash();
+    setJobStatus("The card you had open was removed by someone else.");
+  } else if (touched.has(state.selectedId)) {
+    fillEditor();
+    if (artKey(selected()) !== oldArt) loadArt(); else draw();
+    setSaveStatus("Updated with someone else's changes");
+  }
+}
+
+/** Called when a write's response brought back changes made by someone else. */
+function remoteTouched(ids) {
+  ids.forEach(updateTile);
+  if (ids.has(state.selectedId)) { fillEditor(); draw(); }
+}
+
+/** Pick up decks other people created or renamed, without touching the dropdown if nothing changed. */
+async function refreshDeckList() {
+  try {
+    const { decks } = await api("/api/decks");
+    const sig = (list) => list.map((d) => `${d.slug}:${d.name}`).join(",");
+    if (sig(decks) !== sig(state.decks)) await loadDecks();
+  } catch { /* ignore */ }
+}
+
+setInterval(syncTick, SYNC_MS);
+setInterval(() => { if (!document.hidden) refreshDeckList(); }, SYNC_MS * 10);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { syncTick(); refreshDeckList(); } });
 
 // ---------------------------------------------------------------- art upload & export
 async function uploadArt(id, file, face = artFace(entryById(id))) {
@@ -768,9 +944,12 @@ async function uploadArt(id, file, face = artFace(entryById(id))) {
   const entry = entryById(id);
   try {
     setJobStatus(`Uploading art for ${entry.name}…`);
-    const res = await api(deckApi(`/art/${id}?ext=${ext}&face=${face}`), { method: "POST", body: file });
-    if (face === 1) entry.back = { ...(entry.back || {}), art: res.entry.back.art, crop: res.entry.back.crop };
-    else Object.assign(entry, { art: res.entry.art, crop: res.entry.crop });
+    const res = await tracked(api(deckApi(`/art/${id}?ext=${ext}&face=${face}`), { method: "POST", body: file }));
+    // New art resets the crop on the server: drop any local crop edits for that face so the merge takes it.
+    const s = face === 1 ? entry.back : entry;
+    if (s) s.crop = clone((face === 1 ? state.base[id]?.back : state.base[id])?.crop);
+    mergeEntry(entry, res.entry);
+    state.fileVer[face === 1 ? res.entry.back.art : res.entry.art] = `local${Date.now()}`;
     state.bust = Date.now();
     updateTile(id);
     if (id === state.selectedId) select(id, state.face);
@@ -793,10 +972,10 @@ async function exportProxy() {
   renderNow();
   const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
   try {
-    const res = await api(deckApi(`/proxy/${entry.id}?face=${face}&done=${otherDone ? 1 : 0}`), { method: "POST", body: blob });
-    if (face === 1) entry.back = { ...(entry.back || {}), proxy: res.entry.back.proxy };
-    else entry.proxy = res.entry.proxy;
-    entry.done = res.entry.done;
+    const res = await tracked(api(deckApi(`/proxy/${entry.id}?face=${face}&done=${otherDone ? 1 : 0}`), { method: "POST", body: blob }));
+    entry.done = state.base[entry.id]?.done; // the server decides "done" on export
+    mergeEntry(entry, res.entry);
+    state.fileVer[face === 1 ? res.entry.back.proxy : res.entry.proxy] = `local${Date.now()}`;
     state.bust = Date.now();
     $("#f-done").checked = !!entry.done;
     renderGallery();
@@ -825,7 +1004,7 @@ $("#deck-frame").addEventListener("change", async (ev) => {
   state.deck.defaultFrame = ev.target.value;
   fillFrameSelects();
   draw();
-  try { await api(deckApi(), jsonOpts("PATCH", { defaultFrame: ev.target.value })); }
+  try { await tracked(api(deckApi(), jsonOpts("PATCH", { defaultFrame: ev.target.value }))); }
   catch (e) { setSaveStatus(`Save failed: ${e.message}`); }
 });
 bind("#f-color", "change", (e, t) => { cur(e).frameColor = t.value; changed(); });

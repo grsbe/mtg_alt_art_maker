@@ -14,3 +14,6 @@ Thumbs.db
 frames/*
 !frames/README.md
 public/fonts/card/
+
+# Personal decks (deck.json, art, proxies) stay local.
+decks/

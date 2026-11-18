@@ -671,8 +671,34 @@ def summarize(card: dict) -> dict:
     return s
 
 
+def deck_rev(d: Path) -> str:
+    """Changes whenever deck.json is rewritten (every edit, upload and export goes through it).
+    Browsers poll this to pick up other people's changes."""
+    try:
+        st = (d / "deck.json").stat()
+    except OSError:
+        return ""
+    return f"{st.st_mtime_ns}-{st.st_size}"
+
+
+def deck_file_versions(d: Path, deck: dict) -> dict:
+    """Modification time of every art/proxy file the deck references, used as a cache buster:
+    re-exporting a proxy keeps its file name, so the name alone can't tell browsers it changed."""
+    out = {}
+    for entry in deck["cards"]:
+        for target in (entry, entry.get("back") or {}):
+            for key in ("art", "proxy"):
+                if rel := target.get(key):
+                    try:
+                        out[rel] = (d / rel).stat().st_mtime_ns
+                    except OSError:
+                        pass
+    return out
+
+
 def deck_payload(d: Path) -> dict:
     with DECK_LOCK:
+        rev = deck_rev(d)  # read before loading: a write in between only makes the next poll refetch
         deck = load_deck(d)
     cards, missing = {}, []
     for entry in deck["cards"]:
@@ -680,7 +706,8 @@ def deck_payload(d: Path) -> dict:
         cards[entry["id"]] = summarize(card) if card else None
         if not is_cached(entry["id"]):
             missing.append(entry["id"])
-    return {"slug": d.name, "deck": deck, "cards": cards, "missing": missing}
+    return {"slug": d.name, "deck": deck, "cards": cards, "missing": missing,
+            "rev": rev, "files": deck_file_versions(d, deck)}
 
 
 # --------------------------------------------------------------------------
@@ -758,6 +785,10 @@ class Handler(BaseHTTPRequestHandler):
         if m := re.fullmatch(r"/api/decks/([^/]+)", path):
             if d := self.deck_or_404(m.group(1)):
                 self.send_json(deck_payload(d))
+            return
+        if m := re.fullmatch(r"/api/decks/([^/]+)/rev", path):
+            if d := self.deck_or_404(m.group(1)):
+                self.send_json({"rev": deck_rev(d)})
             return
         if path == "/api/job":
             return self.send_json(JOB.snapshot())
