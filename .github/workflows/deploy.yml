@@ -2,30 +2,35 @@ name: Deploy to Hetzner
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
-
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
-  deploy:
-    name: Build & Deploy via SSH
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Deploy on Hetzner server
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build the Docker image
+        run: docker build . --file Dockerfile --tag mtg-alt-art-maker:$(date +%s)
+
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Hetzner via SSH
+        uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.HETZNER_HOST }}
+          host: ${{ secrets.HETZNER_IP }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
-          port: ${{ secrets.HETZNER_PORT || 22 }}
-          script_stop: true
           script: |
-            cd ${{ secrets.HETZNER_APP_DIR }}
-            git fetch origin main
-            git reset --hard origin/main
-            docker compose up -d --build --remove-orphans
+            cd /opt/projects/artmaker
+            git pull origin main
+            docker compose up -d --build
             docker image prune -f
