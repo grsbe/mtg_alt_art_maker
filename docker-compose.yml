@@ -4,7 +4,13 @@ services:
     container_name: mtg-alt-art-maker
     restart: unless-stopped
     ports:
-      - "8765:8765"
+      - "8765"
     volumes:
       - ./decks:/app/decks
       - ./cache:/app/cache
+    networks:
+      - proxy
+    
+networks:
+  proxy:
+    external: true
