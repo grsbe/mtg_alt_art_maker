@@ -1,8 +1,9 @@
-"""MTG Alt Art Maker - local server.
+"""MTG Alt Art Maker - server (FastAPI + uvicorn).
 
 Run with:  uv run server.py   (then open the printed URL)
+     or:   uv run uvicorn server:app --host 127.0.0.1 --port 8765   (e.g. on a server behind a proxy)
 
-Standard library only. Responsibilities:
+Responsibilities:
   * serve the web UI from ./public
   * import decklists via the Scryfall API; cache card JSON, images and mana symbols in ./cache
   * manage decks, one folder each:  decks/<slug>/deck.json, decks/<slug>/art/, decks/<slug>/proxies/
@@ -16,15 +17,24 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+from contextlib import asynccontextmanager
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC = ROOT / "public"
@@ -715,10 +725,7 @@ def deck_payload(d: Path) -> dict:
 
 
 # --------------------------------------------------------------------------
-# HTTP
-# --------------------------------------------------------------------------
-
-STATIC_MOUNTS = [("/cache/", CACHE), ("/decks/", DECKS), ("/frames/", FRAMES), ("/", PUBLIC)]
+# HTTP (FastAPI + uvicorn)
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -733,249 +740,304 @@ def _write_atomic(path: Path, data: bytes) -> None:
         raise
 
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "MTGAltArt/0.2"
-
-    def log_message(self, fmt, *args):  # only log failures, keep the console readable
-        if len(args) > 1 and str(args[1])[:1] in "45":
-            super().log_message(fmt, *args)
-
-    # ---- helpers ----
-    def _send(self, status: int, body: bytes, ctype: str, cache: str = "no-cache") -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", cache)
-        self.end_headers()
-        self.wfile.write(body)
-
-    def send_json(self, obj, status: int = 200) -> None:
-        self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
-
-    def fail(self, status: int, msg: str) -> None:
-        self.send_json({"error": msg}, status)
-
-    def read_body(self) -> bytes | None:
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_UPLOAD:
-            self.fail(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Upload too large")
-            return None
-        return self.rfile.read(length)
-
-    def read_json(self) -> dict | None:
-        body = self.read_body()
-        if body is None:
-            return None
-        try:
-            data = json.loads(body or b"{}")
-        except json.JSONDecodeError:
-            self.fail(HTTPStatus.BAD_REQUEST, "Invalid JSON")
-            return None
-        if not isinstance(data, dict):
-            self.fail(HTTPStatus.BAD_REQUEST, "Expected a JSON object")
-            return None
-        return data
-
-    def route(self) -> tuple[str, dict]:
-        parsed = urllib.parse.urlparse(self.path)
-        return urllib.parse.unquote(parsed.path), dict(urllib.parse.parse_qsl(parsed.query))
-
-    def deck_or_404(self, slug: str) -> Path | None:
-        d = deck_dir(slug)
-        if d is None:
-            self.fail(HTTPStatus.NOT_FOUND, f"No deck named {slug!r}")
-        return d
-
-    # ---- GET ----
-    def do_GET(self):
-        path, _ = self.route()
-        if path == "/api/decks":
-            return self.send_json({"decks": list_decks()})
-        if m := re.fullmatch(r"/api/decks/([^/]+)", path):
-            if d := self.deck_or_404(m.group(1)):
-                self.send_json(deck_payload(d))
-            return
-        if m := re.fullmatch(r"/api/decks/([^/]+)/rev", path):
-            if d := self.deck_or_404(m.group(1)):
-                self.send_json({"rev": deck_rev(d)})
-            return
-        if path == "/api/job":
-            return self.send_json(JOB.snapshot())
-        if path == "/api/frames":
-            return self.send_json({"frames": list_frames()})
-        if path == "/api/symbols":
-            try:
-                index = symbol_index()
-            except Exception as e:
-                return self.fail(HTTPStatus.BAD_GATEWAY, f"Could not load mana symbols: {e}")
-            return self.send_json({sym: "/symbols/" + uri.rsplit("/", 1)[-1] for sym, uri in index.items()})
-        if m := re.fullmatch(r"/symbols/([^/]+)", path):
-            try:
-                f = symbol_file(m.group(1))
-            except Exception:
-                f = None
-            if f is None:
-                return self.fail(HTTPStatus.NOT_FOUND, "Unknown symbol")
-            return self._send(200, f.read_bytes(), "image/svg+xml", "max-age=86400")
-        if path == "/":
-            path = "/index.html"
-        for prefix, base in STATIC_MOUNTS:
-            if path.startswith(prefix):
-                return self.serve_file(base, path[len(prefix) :])
-        self.fail(HTTPStatus.NOT_FOUND, "Not found")
-
-    def serve_file(self, base: Path, rel: str) -> None:
-        base = base.resolve()
-        target = (base / rel).resolve()
-        if not target.is_relative_to(base) or not target.is_file() or target.name == "deck.json":
-            return self.fail(HTTPStatus.NOT_FOUND, "Not found")
-        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype in ("application/javascript", "application/json"):
-            ctype += "; charset=utf-8"
-        self._send(200, target.read_bytes(), ctype)
-
-    # ---- POST ----
-    def do_POST(self):
-        path, query = self.route()
-        if path == "/api/decks":
-            data = self.read_json()
-            if data is None:
-                return
-            name = data.get("name")
-            if not isinstance(name, str) or not name.strip():
-                return self.fail(HTTPStatus.BAD_REQUEST, "Deck name is empty")
-            return self.send_json({"slug": create_deck(name.strip())})
-        if m := re.fullmatch(r"/api/decks/([^/]+)/(import|refresh)", path):
-            d = self.deck_or_404(m.group(1))
-            if d is None:
-                return
-            if m.group(2) == "import":
-                data = self.read_json()
-                if data is None:
-                    return
-                text = data.get("text", "")
-                if not isinstance(text, str) or not text.strip():
-                    return self.fail(HTTPStatus.BAD_REQUEST, "Decklist is empty")
-                started = JOB.start("import", d.name, run_import, d, text)
-            else:
-                started = JOB.start("refresh", d.name, run_refresh, d)
-            if not started:
-                return self.fail(HTTPStatus.CONFLICT, "Another job is already running")
-            return self.send_json({"ok": True})
-        if m := re.fullmatch(rf"/api/decks/([^/]+)/(art|proxy)/({ID_RE})", path):
-            if d := self.deck_or_404(m.group(1)):
-                self.upload(d, m.group(2), m.group(3), query)
-            return
-        self.fail(HTTPStatus.NOT_FOUND, "Not found")
-
-    def upload(self, d: Path, kind: str, card_id: str, query: dict) -> None:
-        ext = "webp" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
-        if ext not in ART_EXTS:
-            return self.fail(HTTPStatus.BAD_REQUEST, f"Unsupported image type: {ext}")
-        body = self.read_body()
-        if body is None:
-            return
-        if not body:
-            return self.fail(HTTPStatus.BAD_REQUEST, "Empty upload")
-        face = 1 if query.get("face") == "1" else 0  # 1 = the card's second face (stored in entry["back"])
-        with DECK_LOCK:
-            deck = load_deck(d)
-            entry = find_entry(deck, card_id)
-            if entry is None:
-                return self.fail(HTTPStatus.NOT_FOUND, "Card is not in the deck")
-            target = entry.setdefault("back", {}) if face else entry
-            sub = "art" if kind == "art" else "proxies"
-            folder = d / sub
-            rel = f"{sub}/{slugify(entry['name'])}{'_back' if face else ''}.{ext}"
-            key = "art" if kind == "art" else "proxy"
-            old = target.get(key)
-            if old and old != rel:  # replaced with a different extension: remove the stale file
-                old_path = (d / old).resolve()
-                if old_path.is_relative_to(folder.resolve()) and old_path.is_file():
-                    old_path.unlink()
-            _write_atomic(d / rel, body)
-            target[key] = rel
-            if kind == "art":
-                target["crop"] = {"x": 0, "y": 0, "scale": 1, "rot": 0}
-            elif query.get("done", "1") != "0":  # double-faced cards are done once both faces are exported
-                entry["done"] = True
-            save_deck(d, deck)
-        self.send_json({"entry": entry})
-
-    # ---- PATCH ----
-    def do_PATCH(self):
-        path, _ = self.route()
-        if m := re.fullmatch(r"/api/decks/([^/]+)", path):
-            d = self.deck_or_404(m.group(1))
-            if d is None or (data := self.read_json()) is None:
-                return
-            with DECK_LOCK:
-                deck = load_deck(d)
-                if isinstance(data.get("name"), str):
-                    deck["name"] = data["name"].strip() or d.name
-                if isinstance(data.get("defaultFrame"), str) and data["defaultFrame"].strip():
-                    deck["defaultFrame"] = data["defaultFrame"].strip()
-                save_deck(d, deck)
-            return self.send_json({"ok": True})
-        if m := re.fullmatch(rf"/api/decks/([^/]+)/cards/({ID_RE})", path):
-            d = self.deck_or_404(m.group(1))
-            if d is None or (data := self.read_json()) is None:
-                return
-            with DECK_LOCK:
-                deck = load_deck(d)
-                entry = find_entry(deck, m.group(2))
-                if entry is None:
-                    return self.fail(HTTPStatus.NOT_FOUND, "Card is not in the deck")
-                for key, value in data.items():
-                    if key == "back" and isinstance(value, (dict, type(None))):
-                        merge_back(entry, value)
-                    elif key in EDITABLE_KEYS and isinstance(value, EDITABLE_KEYS[key]):
-                        entry[key] = value
-                if entry.get("customName") is not None and not entry["customName"].strip():
-                    entry["customName"] = None
-                entry["overrides"] = {k: v for k, v in entry["overrides"].items() if isinstance(v, str) and v.strip()}
-                save_deck(d, deck)
-            return self.send_json({"entry": entry})
-        self.fail(HTTPStatus.NOT_FOUND, "Not found")
+mimetypes.add_type("application/javascript", ".js")
+mimetypes.add_type("image/webp", ".webp")
+mimetypes.add_type("image/svg+xml", ".svg")
 
 
-class Server(ThreadingHTTPServer):
-    # SO_REUSEADDR lets Windows silently share a port with another program; fail loudly instead.
-    allow_reuse_address = os.name != "nt"
-    daemon_threads = True
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="MTG Alt Art Maker local server")
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
-    args = ap.parse_args()
-
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Runs however the app is started: `uv run server.py` or `uvicorn server:app`.
     for d in (CACHE_CARDS, CACHE_IMAGES, CACHE_SYMBOLS, DECKS, FRAMES):
         d.mkdir(parents=True, exist_ok=True)
     migrate_legacy_layout()
-    mimetypes.add_type("application/javascript", ".js")
-    mimetypes.add_type("image/webp", ".webp")
-    mimetypes.add_type("image/svg+xml", ".svg")
+    yield
 
-    server = None
-    for port in range(args.port, args.port + 20):
+
+app = FastAPI(title="MTG Alt Art Maker", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+# Every error goes out as {"error": "..."}: the frontend shows that text to the user.
+@app.exception_handler(StarletteHTTPException)
+async def http_error(_request: Request, exc: StarletteHTTPException):
+    return JSONResponse({"error": str(exc.detail)}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_request: Request, exc: RequestValidationError):
+    return JSONResponse({"error": "Invalid request"}, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.middleware("http")
+async def no_cache_by_default(request: Request, call_next):
+    """Browsers revalidate everything (cheap thanks to ETags), so edits and new exports show up at once."""
+    response = await call_next(request)
+    response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
+
+def fail(status: int, msg: str) -> HTTPException:
+    return HTTPException(status_code=status, detail=msg)
+
+
+async def read_body(request: Request) -> bytes:
+    length = request.headers.get("content-length", "")
+    if length.isdigit() and int(length) > MAX_UPLOAD:
+        raise fail(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Upload too large")
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_UPLOAD:
+            raise fail(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Upload too large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def json_body(request: Request) -> dict:
+    body = await read_body(request)
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise fail(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+    if not isinstance(data, dict):
+        raise fail(HTTPStatus.BAD_REQUEST, "Expected a JSON object")
+    return data
+
+
+def deck_or_404(slug: str) -> Path:
+    d = deck_dir(slug)
+    if d is None:
+        raise fail(HTTPStatus.NOT_FOUND, f"No deck named {slug!r}")
+    return d
+
+
+def check_card_id(card_id: str) -> None:
+    if not re.fullmatch(ID_RE, card_id):
+        raise fail(HTTPStatus.NOT_FOUND, "Not found")
+
+
+# Plain `def` endpoints run in FastAPI's thread pool, so the threading locks above keep working.
+
+# ---- decks ----
+
+@app.get("/api/decks")
+def get_decks():
+    return {"decks": list_decks()}
+
+
+@app.post("/api/decks")
+def post_deck(data: dict = Depends(json_body)):
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise fail(HTTPStatus.BAD_REQUEST, "Deck name is empty")
+    return {"slug": create_deck(name.strip())}
+
+
+@app.get("/api/decks/{slug}")
+def get_deck(slug: str):
+    return deck_payload(deck_or_404(slug))
+
+
+@app.get("/api/decks/{slug}/rev")
+def get_deck_rev(slug: str):
+    return {"rev": deck_rev(deck_or_404(slug))}
+
+
+@app.patch("/api/decks/{slug}")
+def patch_deck(slug: str, data: dict = Depends(json_body)):
+    d = deck_or_404(slug)
+    with DECK_LOCK:
+        deck = load_deck(d)
+        if isinstance(data.get("name"), str):
+            deck["name"] = data["name"].strip() or d.name
+        if isinstance(data.get("defaultFrame"), str) and data["defaultFrame"].strip():
+            deck["defaultFrame"] = data["defaultFrame"].strip()
+        save_deck(d, deck)
+    return {"ok": True}
+
+
+@app.patch("/api/decks/{slug}/cards/{card_id}")
+def patch_card(slug: str, card_id: str, data: dict = Depends(json_body)):
+    d = deck_or_404(slug)
+    check_card_id(card_id)
+    with DECK_LOCK:
+        deck = load_deck(d)
+        entry = find_entry(deck, card_id)
+        if entry is None:
+            raise fail(HTTPStatus.NOT_FOUND, "Card is not in the deck")
+        for key, value in data.items():
+            if key == "back" and isinstance(value, (dict, type(None))):
+                merge_back(entry, value)
+            elif key in EDITABLE_KEYS and isinstance(value, EDITABLE_KEYS[key]):
+                entry[key] = value
+        if entry.get("customName") is not None and not entry["customName"].strip():
+            entry["customName"] = None
+        entry["overrides"] = {k: v for k, v in entry["overrides"].items() if isinstance(v, str) and v.strip()}
+        save_deck(d, deck)
+    return {"entry": entry}
+
+
+# ---- background jobs ----
+
+def _start_job(started: bool) -> dict:
+    if not started:
+        raise fail(HTTPStatus.CONFLICT, "Another job is already running")
+    return {"ok": True}
+
+
+@app.post("/api/decks/{slug}/import")
+def post_import(slug: str, data: dict = Depends(json_body)):
+    d = deck_or_404(slug)
+    text = data.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        raise fail(HTTPStatus.BAD_REQUEST, "Decklist is empty")
+    return _start_job(JOB.start("import", d.name, run_import, d, text))
+
+
+@app.post("/api/decks/{slug}/refresh")
+def post_refresh(slug: str):
+    d = deck_or_404(slug)
+    return _start_job(JOB.start("refresh", d.name, run_refresh, d))
+
+
+@app.get("/api/job")
+def get_job():
+    return JOB.snapshot()
+
+
+# ---- uploads: raw image bytes in the body ----
+
+def save_upload(d: Path, kind: str, card_id: str, query: dict, body: bytes) -> dict:
+    ext = "png" if kind == "proxy" else (query.get("ext") or "png").lower().lstrip(".")
+    if ext not in ART_EXTS:
+        raise fail(HTTPStatus.BAD_REQUEST, f"Unsupported image type: {ext}")
+    if not body:
+        raise fail(HTTPStatus.BAD_REQUEST, "Empty upload")
+    face = 1 if query.get("face") == "1" else 0  # 1 = the card's second face (stored in entry["back"])
+    with DECK_LOCK:
+        deck = load_deck(d)
+        entry = find_entry(deck, card_id)
+        if entry is None:
+            raise fail(HTTPStatus.NOT_FOUND, "Card is not in the deck")
+        target = entry.setdefault("back", {}) if face else entry
+        sub = "art" if kind == "art" else "proxies"
+        folder = d / sub
+        rel = f"{sub}/{slugify(entry['name'])}{'_back' if face else ''}.{ext}"
+        key = "art" if kind == "art" else "proxy"
+        old = target.get(key)
+        if old and old != rel:  # replaced with a different extension: remove the stale file
+            old_path = (d / old).resolve()
+            if old_path.is_relative_to(folder.resolve()) and old_path.is_file():
+                old_path.unlink()
+        _write_atomic(d / rel, body)
+        target[key] = rel
+        if kind == "art":
+            target["crop"] = {"x": 0, "y": 0, "scale": 1, "rot": 0}
+        elif query.get("done", "1") != "0":  # double-faced cards are done once both faces are exported
+            entry["done"] = True
+        save_deck(d, deck)
+    return {"entry": entry}
+
+
+@app.post("/api/decks/{slug}/{kind}/{card_id}")
+async def post_upload(slug: str, kind: str, card_id: str, request: Request):
+    if kind not in ("art", "proxy"):
+        raise fail(HTTPStatus.NOT_FOUND, "Not found")
+    d = deck_or_404(slug)
+    check_card_id(card_id)
+    body = await read_body(request)
+    return await run_in_threadpool(save_upload, d, kind, card_id, dict(request.query_params), body)
+
+
+# ---- frames and mana symbols ----
+
+@app.get("/api/frames")
+def get_frames():
+    return {"frames": list_frames()}
+
+
+@app.get("/api/symbols")
+def get_symbols():
+    try:
+        index = symbol_index()
+    except Exception as e:
+        raise fail(HTTPStatus.BAD_GATEWAY, f"Could not load mana symbols: {e}")
+    return {sym: "/symbols/" + uri.rsplit("/", 1)[-1] for sym, uri in index.items()}
+
+
+@app.get("/symbols/{name}")
+def get_symbol(name: str):
+    try:
+        f = symbol_file(name)
+    except Exception:
+        f = None
+    if f is None:
+        raise fail(HTTPStatus.NOT_FOUND, "Unknown symbol")
+    return FileResponse(f, media_type="image/svg+xml", headers={"Cache-Control": "max-age=86400"})
+
+
+# ---- static files (mounted last: routes above take precedence) ----
+
+class Static(StaticFiles):
+    """StaticFiles that never serves deck.json (it goes through the API) or half-written temp files."""
+
+    async def get_response(self, path: str, scope):
+        name = Path(path).name
+        if name == "deck.json" or name.endswith(".tmp"):
+            raise fail(HTTPStatus.NOT_FOUND, "Not found")
+        response = await super().get_response(path, scope)
+        ctype = response.headers.get("content-type", "")
+        if ctype in ("application/javascript", "application/json"):  # Starlette only adds it for text/*
+            response.headers["content-type"] = ctype + "; charset=utf-8"
+        return response
+
+
+app.mount("/cache", Static(directory=CACHE, check_dir=False), name="cache")
+app.mount("/decks", Static(directory=DECKS, check_dir=False), name="decks")
+app.mount("/frames", Static(directory=FRAMES, check_dir=False), name="frames")
+app.mount("/", Static(directory=PUBLIC, html=True), name="public")
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def bind_socket(host: str, first_port: int) -> socket.socket:
+    """Bind the first free port from first_port on, so a busy port doesn't stop the app."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    for port in range(first_port, first_port + 20):
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        # SO_REUSEADDR lets Windows silently share a port with another program; only use it elsewhere.
+        if os.name != "nt":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            server = Server((args.host, port), Handler)
-            break
+            sock.bind((host, port))
+            return sock
         except OSError as e:  # in use / reserved by another program (WinError 10013, EADDRINUSE)
+            sock.close()
             print(f"Port {port} is not available ({e.strerror or e}); trying {port + 1}…", flush=True)
-    if server is None:
-        raise SystemExit(f"No free port found in {args.port}-{args.port + 19}. Try --port <number>.")
-    url = f"http://{args.host}:{server.server_address[1]}/"
+    raise SystemExit(f"No free port found in {first_port}-{first_port + 19}. Try --port <number>.")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="MTG Alt Art Maker server")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
+    ap.add_argument("--access-log", action="store_true", help="log every request, not only errors")
+    args = ap.parse_args()
+
+    sock = bind_socket(args.host, args.port)
+    port = sock.getsockname()[1]
+    host = f"[{args.host}]" if ":" in args.host else args.host
+    url = f"http://{host}:{port}/"
     print(f"MTG Alt Art Maker running at {url}  (Ctrl+C to stop)", flush=True)
     if not args.no_browser:
-        threading.Timer(0.6, webbrowser.open, (url,)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
+        threading.Timer(0.8, webbrowser.open, (url,)).start()
+    config = uvicorn.Config(app, log_level="info" if args.access_log else "warning", access_log=args.access_log)
+    uvicorn.Server(config).run(sockets=[sock])
+    print("Stopped.")
 
 
 if __name__ == "__main__":
