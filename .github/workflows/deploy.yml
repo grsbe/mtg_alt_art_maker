@@ -29,7 +29,12 @@ jobs:
           host: ${{ secrets.HETZNER_IP }}
           username: ${{ secrets.HETZNER_USER }}
           key: ${{ secrets.HETZNER_SSH_KEY }}
+          script_stop: true
           script: |
+            if [ ! -d /opt/projects/artmaker/.git ]; then
+              mkdir -p /opt/projects
+              git clone git@github.com:grsbe/mtg_alt_art_maker.git /opt/projects/artmaker
+            fi
             cd /opt/projects/artmaker
             git pull origin main
             docker compose up -d --build
